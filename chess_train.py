@@ -20,6 +20,7 @@ from omegaconf import OmegaConf
 from pydantic import BaseModel
 
 # Set JAX to use BF16 precision
+# JAX only supports 32 or 64 for default dtype bits, so we'll use explicit casting instead
 jax.config.update("jax_enable_x64", False)
 jax.config.update("jax_default_matmul_precision", 'bfloat16')
 
@@ -180,16 +181,19 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     # Get policy and value from model
     (logits, value), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
     
+    # Ensure value is BF16
+    value = value.astype(BF16)
+    
     # Mask invalid actions
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(BF16).min)
 
-    # Get rewards for current player
-    reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
+    # Get rewards for current player and ensure BF16 type
+    reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player].astype(BF16)
     # Set value to 0 if terminal state
     value = jnp.where(state.terminated, jnp.zeros_like(value, dtype=BF16), value)
     # For chess, we alternate between players, so discount is -1
-    discount = -1.0 * jnp.ones_like(value, dtype=BF16)
+    discount = (-1.0 * jnp.ones_like(value)).astype(BF16)
     discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=BF16), discount)
 
     # Return output for MCTS
@@ -249,15 +253,15 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         keys = jax.random.split(key2, batch_size)
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
         
-        # Calculate discount
-        discount = -1.0 * jnp.ones_like(value, dtype=BF16)
+        # Calculate discount - explicit casting to BF16
+        discount = (-1.0 * jnp.ones_like(value)).astype(BF16)
         discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=BF16), discount)
         
         # Return new state and output
         return state, SelfplayOutput(
             obs=observation,
-            action_weights=policy_output.action_weights,
-            reward=state.rewards[jnp.arange(state.rewards.shape[0]), actor],
+            action_weights=policy_output.action_weights.astype(BF16),
+            reward=state.rewards[jnp.arange(state.rewards.shape[0]), actor].astype(BF16),
             terminated=state.terminated,
             discount=discount,
         )
@@ -291,7 +295,10 @@ def compute_loss_input(data: SelfplayOutput) -> Sample:
     # Compute value target by backwards pass
     def body_fn(carry, i):
         ix = config.max_num_steps - i - 1
-        v = data.reward[ix] + data.discount[ix] * carry
+        # Ensure consistent types by explicitly casting
+        reward = data.reward[ix].astype(BF16)
+        discount = data.discount[ix].astype(BF16)
+        v = reward + discount * carry
         return v, v
 
     _, value_tgt = jax.lax.scan(
@@ -300,11 +307,11 @@ def compute_loss_input(data: SelfplayOutput) -> Sample:
         jnp.arange(config.max_num_steps),
     )
     # Reverse to get targets in forward order
-    value_tgt = value_tgt[::-1, :]
+    value_tgt = value_tgt[::-1, :].astype(BF16)
 
     return Sample(
         obs=data.obs,
-        policy_tgt=data.action_weights,
+        policy_tgt=data.action_weights.astype(BF16),
         value_tgt=value_tgt,
         mask=value_mask,
     )
@@ -316,12 +323,18 @@ def loss_fn(model_params, model_state, samples: Sample):
         model_params, model_state, samples.obs, is_eval=False
     )
 
+    # Ensure BF16 precision
+    logits = logits.astype(BF16)
+    value = value.astype(BF16)
+    policy_tgt = samples.policy_tgt.astype(BF16)
+    value_tgt = samples.value_tgt.astype(BF16)
+
     # Policy loss (cross entropy)
-    policy_loss = optax.softmax_cross_entropy(logits, samples.policy_tgt)
+    policy_loss = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.mean(policy_loss)
 
     # Value loss (L2)
-    value_loss = optax.l2_loss(value, samples.value_tgt)
+    value_loss = optax.l2_loss(value, value_tgt)
     value_loss = jnp.mean(value_loss * samples.mask)  # masked for truncated episodes
 
     # Combined loss
