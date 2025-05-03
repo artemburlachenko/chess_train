@@ -19,6 +19,13 @@ import haiku as hk
 from omegaconf import OmegaConf
 from pydantic import BaseModel
 
+# Set JAX to use BF16 precision
+jax.config.update("jax_default_dtype_bits", 16)
+jax.config.update("jax_enable_x64", False)
+jax.config.update("jax_default_matmul_precision", jax.lax.Precision.DEFAULT)
+
+# Define custom dtype for BF16
+BF16 = jnp.bfloat16
 
 class Config(BaseModel):
     env_id: str = "chess"  # Using chess environment
@@ -37,6 +44,8 @@ class Config(BaseModel):
     learning_rate: float = 0.001
     # eval params
     eval_interval: int = 5
+    # precision params
+    use_bf16: bool = True  # Enable BF16 precision
 
     class Config:
         extra = "forbid"
@@ -88,8 +97,8 @@ class AZNet(hk.Module):
         self.resnet_v2 = resnet_v2
         
     def __call__(self, x, is_training, test_local_stats):
-        # Convert input to float32
-        x = x.astype(jnp.float32)
+        # Convert input to bfloat16
+        x = x.astype(BF16)
         
         # Initial convolutional layer
         x = hk.Conv2D(self.num_channels, kernel_shape=3, padding="SAME")(x)
@@ -174,15 +183,15 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     
     # Mask invalid actions
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(BF16).min)
 
     # Get rewards for current player
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
     # Set value to 0 if terminal state
-    value = jnp.where(state.terminated, 0.0, value)
+    value = jnp.where(state.terminated, jnp.zeros_like(value, dtype=BF16), value)
     # For chess, we alternate between players, so discount is -1
-    discount = -1.0 * jnp.ones_like(value)
-    discount = jnp.where(state.terminated, 0.0, discount)
+    discount = -1.0 * jnp.ones_like(value, dtype=BF16)
+    discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=BF16), discount)
 
     # Return output for MCTS
     recurrent_fn_output = mctx.RecurrentFnOutput(
@@ -231,7 +240,7 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             num_simulations=config.num_simulations,
             invalid_actions=~state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            gumbel_scale=1.0,
+            gumbel_scale=jnp.array(1.0, dtype=BF16),
         )
         
         # Record current player
@@ -242,8 +251,8 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
         
         # Calculate discount
-        discount = -1.0 * jnp.ones_like(value)
-        discount = jnp.where(state.terminated, 0.0, discount)
+        discount = -1.0 * jnp.ones_like(value, dtype=BF16)
+        discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=BF16), discount)
         
         # Return new state and output
         return state, SelfplayOutput(
@@ -288,7 +297,7 @@ def compute_loss_input(data: SelfplayOutput) -> Sample:
 
     _, value_tgt = jax.lax.scan(
         body_fn,
-        jnp.zeros(batch_size),
+        jnp.zeros(batch_size, dtype=BF16),
         jnp.arange(config.max_num_steps),
     )
     # Reverse to get targets in forward order
@@ -388,16 +397,24 @@ def evaluate(rng_key, my_model):
 if __name__ == "__main__":
     # Initialize wandb
     wandb.init(project="pgx-chess-az", config=config.model_dump())
+    
+    # Log BF16 usage
+    wandb.config.update({"using_bf16": True})
 
     # Initialize model and optimizer
     print("Initializing model...")
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
-    dummy_input = dummy_state.observation
+    dummy_input = dummy_state.observation.astype(BF16)  # Convert to BF16
     model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
     opt_state = optimizer.init(params=model[0])
     
     # Put model and optimizer on devices
     model, opt_state = jax.device_put_replicated((model, opt_state), devices)
+
+    # Log device type and if hardware supports BF16
+    device_type = jax.devices()[0].platform
+    print(f"Running on {device_type} devices with BF16 precision")
+    wandb.config.update({"device_type": device_type})
 
     # Prepare checkpoint directory
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
