@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 # Set JAX to use BF16 precision
 jax.config.update("jax_enable_x64", False)
-jax.config.update("jax_default_matmul_precision", jax.lax.Precision.DEFAULT)
+jax.config.update("jax_default_matmul_precision", 'bfloat16')
 
 # Define custom dtype for BF16
 BF16 = jnp.bfloat16
