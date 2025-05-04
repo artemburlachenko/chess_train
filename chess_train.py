@@ -46,6 +46,8 @@ class Config(BaseModel):
     eval_interval: int = 5
     # precision params
     use_bf16: bool = True  # Enable BF16 precision
+    # baseline model
+    baseline: str = "./checkpoints/chess_20250504070715/000030.ckpt"
 
     class Config:
         extra = "forbid"
@@ -362,12 +364,28 @@ def train(model, opt_state, data: Sample):
     return model, opt_state, policy_loss, value_loss
 
 
+def load_baseline_model():
+    """Load the baseline model from checkpoint."""
+    if not os.path.exists(config.baseline):
+        print(f"Warning: Baseline checkpoint {config.baseline} not found. Using random policy instead.")
+        return None
+    
+    print(f"Loading baseline model from {config.baseline}...")
+    with open(config.baseline, "rb") as f:
+        checkpoint = pickle.load(f)
+    
+    baseline_model = checkpoint["model"]
+    return baseline_model
+
 @jax.pmap
 def evaluate(rng_key, my_model):
     """Evaluate model against baseline."""
     my_player = 0
     my_model_params, my_model_state = my_model
 
+    # Try to load the baseline model
+    baseline_model = load_baseline_model()
+    
     key, subkey = jax.random.split(rng_key)
     batch_size = config.selfplay_batch_size // num_devices
     keys = jax.random.split(subkey, batch_size)
@@ -376,13 +394,20 @@ def evaluate(rng_key, my_model):
     def body_fn(val):
         key, state, R = val
         
-        # Get logits from both models
+        # Get logits from my model
         (my_logits, _), _ = forward.apply(
             my_model_params, my_model_state, state.observation, is_eval=True
         )
-        opp_logits, _ = random_policy(state.observation)
         
-        # Use my model when my turn, else use random policy
+        # Get logits from baseline model or use random policy
+        if baseline_model is not None:
+            (opp_logits, _), _ = forward.apply(
+                baseline_model, {}, state.observation, is_eval=True
+            )
+        else:
+            opp_logits, _ = random_policy(state.observation)
+        
+        # Use my model when my turn, else use baseline/random policy
         is_my_turn = (state.current_player == my_player).reshape((-1, 1))
         logits = jnp.where(is_my_turn, my_logits, opp_logits)
         
@@ -417,8 +442,30 @@ if __name__ == "__main__":
     print("Initializing model...")
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
     dummy_input = dummy_state.observation.astype(BF16)  # Convert to BF16
-    model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
-    opt_state = optimizer.init(params=model[0])
+    
+    # Check if we should load from baseline
+    if os.path.exists(config.baseline):
+        print(f"Loading initial model from baseline: {config.baseline}")
+        with open(config.baseline, "rb") as f:
+            checkpoint = pickle.load(f)
+        model = checkpoint["model"]
+        # Initialize new optimizer state for the loaded model
+        opt_state = optimizer.init(params=model[0])
+        
+        # Continue training from checkpoint's iteration and stats if available
+        if "iteration" in checkpoint:
+            iteration = checkpoint["iteration"]
+            print(f"Continuing from iteration {iteration}")
+        if "hours" in checkpoint:
+            hours = checkpoint["hours"]
+            print(f"Continuing from {hours:.2f} training hours")
+        if "frames" in checkpoint:
+            frames = checkpoint["frames"]
+            print(f"Continuing from {frames} frames")
+    else:
+        print("Initializing new model (baseline not found)")
+        model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
+        opt_state = optimizer.init(params=model[0])
     
     # Put model and optimizer on devices
     model, opt_state = jax.device_put_replicated((model, opt_state), devices)
@@ -434,10 +481,13 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Initialize logging
-    iteration = 0
-    hours = 0.0
-    frames = 0
+    # Initialize logging - these values might be overridden from the loaded checkpoint
+    if 'iteration' not in locals():
+        iteration = 0
+    if 'hours' not in locals():
+        hours = 0.0
+    if 'frames' not in locals():
+        frames = 0
     log = {"iteration": iteration, "hours": hours, "frames": frames}
 
     # Main training loop
