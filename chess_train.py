@@ -369,10 +369,14 @@ def load_model_from_checkpoint(checkpoint_path):
         return None
     
     print(f"Loading model from {checkpoint_path}...")
-    with open(checkpoint_path, "rb") as f:
-        checkpoint = pickle.load(f)
-    
-    return checkpoint
+    try:
+        with open(checkpoint_path, "rb") as f:
+            checkpoint = pickle.load(f)
+        return checkpoint
+    except (pickle.UnpicklingError, EOFError) as e:
+        print(f"Error loading checkpoint: {e}")
+        print(f"The checkpoint file {checkpoint_path} appears to be corrupted or truncated.")
+        return None
 
 
 # Global variable to store the loaded baseline model
