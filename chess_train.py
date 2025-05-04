@@ -97,9 +97,7 @@ class AZNet(hk.Module):
         self.resnet_v2 = resnet_v2
         
     def __call__(self, x, is_training, test_local_stats):
-        # Convert input to bfloat16
-        x = x.astype(BF16)
-        
+        # Input should already be BF16 from forward_fn
         # Initial convolutional layer
         x = hk.Conv2D(self.num_channels, kernel_shape=3, padding="SAME")(x)
         
@@ -159,6 +157,8 @@ def forward_fn(x, is_eval=False):
         num_blocks=config.num_layers,
         resnet_v2=config.resnet_v2,
     )
+    # Ensure x is BF16 before passing to network
+    x = x.astype(BF16)
     policy_out, value_out = net(x, is_training=not is_eval, test_local_stats=False)
     return policy_out, value_out
 
@@ -226,9 +226,10 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         key1, key2 = jax.random.split(key)
         observation = state.observation
 
-        # Get policy and value from model
+        # Get policy and value from model - ensure observation is BF16
+        observation_bf16 = observation.astype(BF16)
         (logits, value), _ = forward.apply(
-            model_params, model_state, state.observation, is_eval=True
+            model_params, model_state, observation_bf16, is_eval=True
         )
         
         # Create root for MCTS
@@ -362,6 +363,16 @@ def train(model, opt_state, data: Sample):
     return model, opt_state, policy_loss, value_loss
 
 
+# Add function to cast model parameters to BF16
+def cast_params_to_bf16(params):
+    """Cast all parameters to bfloat16."""
+    def _cast(x):
+        if hasattr(x, 'dtype') and x.dtype != BF16 and x.dtype != jnp.int32 and x.dtype != jnp.bool_:
+            return x.astype(BF16)
+        return x
+    return jax.tree_util.tree_map(_cast, params)
+
+
 def load_model_from_checkpoint(checkpoint_path):
     """Load model from checkpoint file."""
     if not os.path.exists(checkpoint_path):
@@ -372,6 +383,12 @@ def load_model_from_checkpoint(checkpoint_path):
     try:
         with open(checkpoint_path, "rb") as f:
             checkpoint = pickle.load(f)
+        
+        # Cast model parameters to BF16
+        if "model" in checkpoint:
+            model_params, model_state = checkpoint["model"]
+            checkpoint["model"] = (cast_params_to_bf16(model_params), model_state)
+            
         return checkpoint
     except (pickle.UnpicklingError, EOFError) as e:
         print(f"Error loading checkpoint: {e}")
@@ -405,9 +422,10 @@ def evaluate(rng_key, my_model):
     def body_fn(val):
         key, state, R = val
         
-        # Get logits from my model
+        # Get logits from my model - ensure observation is BF16
+        observation = state.observation.astype(BF16)
         (my_logits, _), _ = forward.apply(
-            my_model_params, my_model_state, state.observation, is_eval=True
+            my_model_params, my_model_state, observation, is_eval=True
         )
         
         # Get logits from baseline model or use random policy
@@ -418,10 +436,10 @@ def evaluate(rng_key, my_model):
             if baseline_state is None:
                 baseline_state = {}
             (opp_logits, _), _ = forward.apply(
-                baseline_params, baseline_state, state.observation, is_eval=True
+                baseline_params, baseline_state, observation, is_eval=True
             )
         else:
-            opp_logits, _ = random_policy(state.observation)
+            opp_logits, _ = random_policy(observation)
         
         # Use my model when my turn, else use baseline/random policy
         is_my_turn = (state.current_player == my_player).reshape((-1, 1))
@@ -464,6 +482,9 @@ if __name__ == "__main__":
     if checkpoint is not None:
         print(f"Loading initial model from baseline: {config.baseline}")
         model = checkpoint["model"]
+        # Ensure model parameters are BF16
+        model_params, model_state = model
+        model = (cast_params_to_bf16(model_params), model_state)
         # Store the baseline model in the global variable for evaluation
         BASELINE_MODEL = model
         
@@ -490,7 +511,11 @@ if __name__ == "__main__":
             frames = 0
     else:
         print("Warning: Baseline checkpoint not found. Initializing new model.")
-        model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
+        # Initialize with BF16 input to ensure parameters are BF16
+        model = forward.init(jax.random.PRNGKey(0), dummy_input)
+        # Convert parameters to BF16 for safety
+        model_params, model_state = model
+        model = (cast_params_to_bf16(model_params), model_state)
         opt_state = optimizer.init(params=model[0])
         iteration = 0
         hours = 0.0
