@@ -65,8 +65,6 @@ else:
 
 # Create chess environment
 env = pgx.make(config.env_id)
-# Instead of using baseline, create a random policy function
-# baseline = pgx.make_baseline_model(config.env_id + "_v0")
 
 def random_policy(observation):
     """Simple random policy for evaluation."""
@@ -364,27 +362,36 @@ def train(model, opt_state, data: Sample):
     return model, opt_state, policy_loss, value_loss
 
 
-def load_baseline_model():
-    """Load the baseline model from checkpoint."""
-    if not os.path.exists(config.baseline):
-        print(f"Warning: Baseline checkpoint {config.baseline} not found. Using random policy instead.")
+def load_model_from_checkpoint(checkpoint_path):
+    """Load model from checkpoint file."""
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint {checkpoint_path} not found.")
         return None
     
-    print(f"Loading baseline model from {config.baseline}...")
-    with open(config.baseline, "rb") as f:
+    print(f"Loading model from {checkpoint_path}...")
+    with open(checkpoint_path, "rb") as f:
         checkpoint = pickle.load(f)
     
-    baseline_model = checkpoint["model"]
-    return baseline_model
+    return checkpoint
+
+
+# Global variable to store the loaded baseline model
+BASELINE_MODEL = None
 
 @jax.pmap
 def evaluate(rng_key, my_model):
     """Evaluate model against baseline."""
+    global BASELINE_MODEL
     my_player = 0
     my_model_params, my_model_state = my_model
 
-    # Try to load the baseline model
-    baseline_model = load_baseline_model()
+    # Load the baseline model if not already loaded
+    if BASELINE_MODEL is None:
+        checkpoint = load_model_from_checkpoint(config.baseline)
+        if checkpoint is not None:
+            BASELINE_MODEL = checkpoint["model"]
+        else:
+            print(f"Warning: Baseline checkpoint {config.baseline} not found. Using random policy for evaluation.")
     
     key, subkey = jax.random.split(rng_key)
     batch_size = config.selfplay_batch_size // num_devices
@@ -400,9 +407,14 @@ def evaluate(rng_key, my_model):
         )
         
         # Get logits from baseline model or use random policy
-        if baseline_model is not None:
+        if BASELINE_MODEL is not None:
+            # Ensure baseline model parameters aren't None
+            baseline_params, baseline_state = BASELINE_MODEL
+            # If baseline_state is empty, provide an empty dict
+            if baseline_state is None:
+                baseline_state = {}
             (opp_logits, _), _ = forward.apply(
-                baseline_model, {}, state.observation, is_eval=True
+                baseline_params, baseline_state, state.observation, is_eval=True
             )
         else:
             opp_logits, _ = random_policy(state.observation)
@@ -443,12 +455,14 @@ if __name__ == "__main__":
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
     dummy_input = dummy_state.observation.astype(BF16)  # Convert to BF16
     
-    # Check if we should load from baseline
-    if os.path.exists(config.baseline):
+    # Always try to load from baseline for initial model
+    checkpoint = load_model_from_checkpoint(config.baseline)
+    if checkpoint is not None:
         print(f"Loading initial model from baseline: {config.baseline}")
-        with open(config.baseline, "rb") as f:
-            checkpoint = pickle.load(f)
         model = checkpoint["model"]
+        # Store the baseline model in the global variable for evaluation
+        BASELINE_MODEL = model
+        
         # Initialize new optimizer state for the loaded model
         opt_state = optimizer.init(params=model[0])
         
@@ -456,16 +470,27 @@ if __name__ == "__main__":
         if "iteration" in checkpoint:
             iteration = checkpoint["iteration"]
             print(f"Continuing from iteration {iteration}")
+        else:
+            iteration = 0
+            
         if "hours" in checkpoint:
             hours = checkpoint["hours"]
             print(f"Continuing from {hours:.2f} training hours")
+        else:
+            hours = 0.0
+            
         if "frames" in checkpoint:
             frames = checkpoint["frames"]
             print(f"Continuing from {frames} frames")
+        else:
+            frames = 0
     else:
-        print("Initializing new model (baseline not found)")
+        print("Warning: Baseline checkpoint not found. Initializing new model.")
         model = forward.init(jax.random.PRNGKey(0), dummy_input)  # (params, state)
         opt_state = optimizer.init(params=model[0])
+        iteration = 0
+        hours = 0.0
+        frames = 0
     
     # Put model and optimizer on devices
     model, opt_state = jax.device_put_replicated((model, opt_state), devices)
@@ -481,13 +506,7 @@ if __name__ == "__main__":
     ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Initialize logging - these values might be overridden from the loaded checkpoint
-    if 'iteration' not in locals():
-        iteration = 0
-    if 'hours' not in locals():
-        hours = 0.0
-    if 'frames' not in locals():
-        frames = 0
+    # Initialize logging
     log = {"iteration": iteration, "hours": hours, "frames": frames}
 
     # Main training loop
