@@ -37,7 +37,7 @@ class Config(BaseModel):
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
-    num_simulations: int = 64  # More simulations for chess
+    num_simulations: int = 128  # More simulations for chess
     max_num_steps: int = 256  # Chess games can be longer
     # training params
     training_batch_size: int = 4096
@@ -47,7 +47,7 @@ class Config(BaseModel):
     # precision params
     use_bf16: bool = True  # Enable BF16 precision
     # baseline model
-    baseline: str = "./checkpoints/chess_20250504070715/000030.ckpt"
+    baseline: str = "./baseline.ckpt"
 
     class Config:
         extra = "forbid"
