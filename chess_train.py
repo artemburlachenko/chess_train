@@ -43,7 +43,7 @@ class Config(BaseModel):
     training_batch_size: int = 4096
     learning_rate: float = 0.001
     # eval params
-    eval_interval: int = 5
+    eval_interval: int = 2
     # precision params
     use_bf16: bool = True  # Enable BF16 precision
     # baseline model
