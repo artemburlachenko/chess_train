@@ -1,1 +1,16 @@
 checkpoints/chess_20250504070715/*.ckpt
+full/
+games/
+play/full/
+play/node_modules/
+play/package-lock.json
+play/package.json
+play/tsconfig.json
+play/tsconfig.node.json
+play/tsconfig.app.json
+play/__pycache__/
+play/dist/
+play/build/
+play/node_modules/
+play/package-lock.json
+play/package.json

@@ -1,0 +1,11 @@
+pgx>=2.1.0
+flask>=2.0.0
+flask-cors>=3.0.10
+jax>=0.4.1
+jaxlib>=0.4.1
+optax>=0.1.4
+haiku>=0.0.9
+mctx>=0.0.6
+numpy>=1.24.0
+vue3-chessboard>=1.2.5
+axios>=1.5.0 
