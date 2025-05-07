@@ -607,8 +607,10 @@ if __name__ == "__main__":
         
         # Create minibatches
         num_updates = samples.obs.shape[0] // config.training_batch_size
+        batch_per_device = config.training_batch_size // num_devices
         minibatches = jax.tree_util.tree_map(
-            lambda x: x.reshape((num_updates, num_devices, -1) + x.shape[1:]), samples
+            lambda x: x[:num_updates * config.training_batch_size].reshape((num_updates, num_devices, batch_per_device) + x.shape[1:]), 
+            samples
         )
 
         # Training
