@@ -38,7 +38,7 @@ class Config(BaseModel):
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 64  # More simulations for chess
-    max_num_steps: int = 350  # Chess games can be longer
+    max_num_steps: int = 256  # Chess games can be longer
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
