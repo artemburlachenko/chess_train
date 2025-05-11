@@ -37,11 +37,11 @@ class Config(BaseModel):
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 512
-    num_simulations: int = 256  # More simulations for chess
-    max_num_steps: int = 340  # Chess games can be longer
+    num_simulations: int = 192  
+    max_num_steps: int = 288  
     # training params
     training_batch_size: int = 4096
-    learning_rate: float = 0.0006
+    learning_rate: float = 0.0002
     # eval params
     eval_interval: int = 1
     # precision params
