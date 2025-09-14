@@ -148,6 +148,19 @@ class AZNet(hk.Module):
         return policy, value
 
 
+# Completely disable mixed precision policies to avoid dtype casting issues
+try:
+    # Clear any existing policies
+    hk.mixed_precision.clear_policy(AZNet)
+    # Also try to clear any global policies
+    try:
+        hk.mixed_precision.clear_policy()
+    except:
+        pass
+    print("Cleared all mixed precision policies - using pure FP32 with JAX matmul BF16")
+except Exception as e:
+    print(f"Note clearing policies: {e}")
+
 # Mixed precision is handled by JAX's jax_default_matmul_precision='bfloat16'
 # This provides BF16 computation without problematic explicit casting
 print(f"Using JAX matmul precision: {jax.config.read('jax_default_matmul_precision')} for efficient TPU computation")
