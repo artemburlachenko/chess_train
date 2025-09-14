@@ -434,10 +434,8 @@ def evaluate(rng_key, my_model, baseline_model):
     def body_fn(val):
         key, state, R = val
         
-        # Get logits from my model - inputs can be BF16 for computation
+        # Get logits from my model - forward_fn handles dtype conversion
         observation = state.observation
-        if config.use_bf16:
-            observation = observation.astype(BF16)
         (my_logits, _), _ = forward.apply(
             my_model_params, my_model_state, observation, is_eval=True
         )
