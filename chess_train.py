@@ -178,7 +178,7 @@ except Exception as e:
 
 # Mixed precision is handled by JAX's jax_default_matmul_precision='bfloat16'
 # This provides BF16 computation without problematic explicit casting
-print(f"Using JAX matmul precision: {jax.config.read('jax_default_matmul_precision')} for efficient TPU computation")
+print(f"Using JAX matmul precision: {jax.config.jax_default_matmul_precision} for efficient TPU computation")
 
 
 def forward_fn(x, is_eval=False):
