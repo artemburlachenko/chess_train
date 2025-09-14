@@ -148,22 +148,9 @@ class AZNet(hk.Module):
         return policy, value
 
 
-# Set up mixed precision policy for proper BF16 usage on TPU
-try:
-    import jmp
-    if config.use_bf16:
-        # Apply mixed precision policy: FP32 params, BF16 compute, FP32 output
-        mixed_precision_policy = jmp.Policy(
-            param_dtype=jnp.float32,      # Keep parameters in FP32
-            compute_dtype=jnp.bfloat16,   # Use BF16 for computations
-            output_dtype=jnp.float32      # Output in FP32 for stability
-        )
-        hk.mixed_precision.set_policy(AZNet, mixed_precision_policy)
-        print("Mixed precision policy applied: FP32 params, BF16 compute")
-except ImportError:
-    print("JMP not available, using JAX default matmul precision for mixed precision")
-except Exception as e:
-    print(f"Mixed precision policy not applied: {e}")
+# Mixed precision is handled by JAX's jax_default_matmul_precision='bfloat16'
+# This provides BF16 computation without problematic explicit casting
+print(f"Using JAX matmul precision: {jax.config.read('jax_default_matmul_precision')} for efficient TPU computation")
 
 
 def forward_fn(x, is_eval=False):
