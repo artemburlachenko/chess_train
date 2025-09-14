@@ -36,7 +36,7 @@ class Config(BaseModel):
     num_layers: int = 6  # Deeper network for chess
     resnet_v2: bool = True
     # selfplay params
-    selfplay_batch_size: int = 256
+    selfplay_batch_size: int = 2048
     num_simulations: int = 64  
     max_num_steps: int = 256  
     # training params
@@ -293,7 +293,7 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         discount = jnp.where(state.terminated, jnp.zeros_like(discount), discount)
         
         # Return new state and output
-        # Return output (keep in native dtype, will be converted later if needed)
+        # Return output (keep in native dtype)
         return state, SelfplayOutput(
             obs=observation,
             action_weights=policy_output.action_weights,
@@ -652,36 +652,54 @@ if __name__ == "__main__":
         data = selfplay(model, keys)
         samples = compute_loss_input(data)
 
-        # Prepare training data
-        print("Preparing training data...")
-        samples = jax.device_get(samples)  # (#devices, batch, max_num_steps, ...)
-        frames += samples.obs.shape[0] * samples.obs.shape[1] * samples.obs.shape[2]
-        samples = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[3:])), samples)
+        # Prepare training data ON-DEVICE (no device_get!)
+        print("Preparing training data (on-device)...")
         
-        # Shuffle samples
-        rng_key, subkey = jax.random.split(rng_key)
-        ixs = jax.random.permutation(subkey, jnp.arange(samples.obs.shape[0]))
-        samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)
+        # samples is currently: pytree with arrays shape [devices, T, B, ...]
+        T = config.max_num_steps
+        B = config.selfplay_batch_size // num_devices
+        global_bs = config.training_batch_size
+        assert global_bs % num_devices == 0, "training_batch_size must be divisible by num_devices"
+        per_dev_bs = global_bs // num_devices
         
-        # Create minibatches
-        num_updates = samples.obs.shape[0] // config.training_batch_size
-        batch_per_device = config.training_batch_size // num_devices
-        minibatches = jax.tree_util.tree_map(
-            lambda x: x[:num_updates * config.training_batch_size].reshape((num_updates, num_devices, batch_per_device) + x.shape[1:]), 
-            samples
-        )
-
+        # 1) Flatten time and batch axes on device: [D, T, B, ...] -> [D, T*B, ...]
+        def _flatten_tb(x):
+            return x.reshape((x.shape[0], T * B) + x.shape[3:])
+        
+        samples = jax.tree_util.tree_map(_flatten_tb, samples)
+        
+        # 2) Pack into minibatches on device
+        total_global = num_devices * T * B
+        num_updates = total_global // global_bs
+        take_per_dev = num_updates * per_dev_bs
+        
+        def _pack_minibatches(x):
+            # x: [D, T*B, ...] -> trim and pack into [num_updates, D, per_dev_bs, ...]
+            x = x[:, :take_per_dev, ...]
+            x = x.reshape((x.shape[0], num_updates, per_dev_bs) + x.shape[2:])  # [D, U, per_dev_bs, ...]
+            x = jnp.swapaxes(x, 0, 1)  # -> [U, D, per_dev_bs, ...]
+            return x
+        
+        minibatches = jax.tree_util.tree_map(_pack_minibatches, samples)
+        
         # Training
-        print(f"Training on {num_updates} minibatches...")
-        policy_losses, value_losses = [], []
+        print(f"Training on {num_updates} minibatches (per_dev_bs={per_dev_bs})...")
+        policy_losses = []
+        value_losses = []
         for i in range(num_updates):
-            minibatch = jax.tree_util.tree_map(lambda x: x[i], minibatches)
-            model, opt_state, policy_loss, value_loss = train(model, opt_state, minibatch)
-            policy_losses.append(policy_loss.mean().item())
-            value_losses.append(value_loss.mean().item())
+            mb = jax.tree_util.tree_map(lambda x: x[i], minibatches)  # [D, per_dev_bs, ...]
+            model, opt_state, policy_loss, value_loss = train(model, opt_state, mb)
+            # Block until ready for accurate timing and to avoid output overtaking computation
+            policy_loss = policy_loss.mean().block_until_ready()
+            value_loss = value_loss.mean().block_until_ready() 
+            policy_losses.append(float(policy_loss))
+            value_losses.append(float(value_loss))
         
         policy_loss = sum(policy_losses) / len(policy_losses)
         value_loss = sum(value_losses) / len(value_losses)
+        
+        # Count frames without device_get
+        frames += total_global  # D * T * B
 
         # Log training metrics
         et = time.time()
