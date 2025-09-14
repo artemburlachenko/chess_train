@@ -411,11 +411,10 @@ def ensure_jax_arrays(tree):
         if hasattr(x, 'dtype') and not isinstance(x, jnp.ndarray):
             # Handle bfloat16 specially - convert via float32
             if str(x.dtype) == 'bfloat16':
-                # Convert to float32 first, then to JAX bfloat16
-                x_float = x.astype('float32')
-                return jnp.array(x_float, dtype=BF16)
+                # First convert to JAX float32, then to BF16
+                return jnp.asarray(x, dtype=jnp.float32).astype(BF16)
             else:
-                return jnp.array(x)
+                return jnp.asarray(x)
         return x
     return jax.tree_util.tree_map(_convert, tree)
 
