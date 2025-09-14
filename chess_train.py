@@ -24,7 +24,7 @@ from pydantic import BaseModel
 jax.config.update("jax_enable_x64", False)
 jax.config.update("jax_default_matmul_precision", 'bfloat16')
 
-# Define custom dtype for BF16
+# Define custom dtype for BF16 - always use JAX's bfloat16
 BF16 = jnp.bfloat16
 
 class Config(BaseModel):
@@ -157,15 +157,28 @@ def forward_fn(x, is_eval=False):
         num_blocks=config.num_layers,
         resnet_v2=config.resnet_v2,
     )
-    # Ensure x is BF16 before passing to network
-    x = x.astype(BF16)
+    # Ensure x is BF16 before passing to network (only if using BF16)
+    if config.use_bf16:
+        x = x.astype(BF16)
+    else:
+        x = x.astype(jnp.float32)
     policy_out, value_out = net(x, is_training=not is_eval, test_local_stats=False)
     return policy_out, value_out
 
 
 # Transform forward function and create optimizer
 forward = hk.without_apply_rng(hk.transform_with_state(forward_fn))
-optimizer = optax.adam(learning_rate=config.learning_rate)
+# Create optimizer with FP32 momentum states even when using BF16 parameters
+optimizer = optax.chain(
+    optax.scale_by_adam(
+        b1=0.9, 
+        b2=0.999, 
+        eps=1e-8,
+        mu_dtype=jnp.float32,  # Keep 1st moment in FP32
+        nu_dtype=jnp.float32   # Keep 2nd moment in FP32
+    ),
+    optax.scale(-config.learning_rate)
+)
 
 
 def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.State):
@@ -181,20 +194,28 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     # Get policy and value from model
     (logits, value), _ = forward.apply(model_params, model_state, state.observation, is_eval=True)
     
-    # Ensure value is BF16
-    value = value.astype(BF16)
+    # Ensure consistent dtype based on config
+    if config.use_bf16:
+        value = value.astype(BF16)
+        reward = reward.astype(BF16)
+        discount = discount.astype(BF16)
+    else:
+        value = value.astype(jnp.float32)
+        reward = reward.astype(jnp.float32)
+        discount = discount.astype(jnp.float32)
     
     # Mask invalid actions
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(BF16).min)
 
-    # Get rewards for current player and ensure BF16 type
-    reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player].astype(BF16)
+    # Get rewards for current player
+    reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
     # Set value to 0 if terminal state
-    value = jnp.where(state.terminated, jnp.zeros_like(value, dtype=BF16), value)
+    dtype = BF16 if config.use_bf16 else jnp.float32
+    value = jnp.where(state.terminated, jnp.zeros_like(value, dtype=dtype), value)
     # For chess, we alternate between players, so discount is -1
-    discount = (-1.0 * jnp.ones_like(value)).astype(BF16)
-    discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=BF16), discount)
+    discount = (-1.0 * jnp.ones_like(value)).astype(dtype)
+    discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=dtype), discount)
 
     # Return output for MCTS
     recurrent_fn_output = mctx.RecurrentFnOutput(
@@ -226,10 +247,13 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         key1, key2 = jax.random.split(key)
         observation = state.observation
 
-        # Get policy and value from model - ensure observation is BF16
-        observation_bf16 = observation.astype(BF16)
+        # Get policy and value from model - ensure correct dtype
+        if config.use_bf16:
+            observation = observation.astype(BF16)
+        else:
+            observation = observation.astype(jnp.float32)
         (logits, value), _ = forward.apply(
-            model_params, model_state, observation_bf16, is_eval=True
+            model_params, model_state, observation, is_eval=True
         )
         
         # Create root for MCTS
@@ -244,7 +268,7 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             num_simulations=config.num_simulations,
             invalid_actions=~state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            gumbel_scale=jnp.array(1.0, dtype=BF16),
+            gumbel_scale=jnp.array(1.0, dtype=BF16 if config.use_bf16 else jnp.float32),
         )
         
         # Record current player
@@ -254,15 +278,18 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         keys = jax.random.split(key2, batch_size)
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
         
-        # Calculate discount - explicit casting to BF16
-        discount = (-1.0 * jnp.ones_like(value)).astype(BF16)
-        discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=BF16), discount)
+        # Calculate discount - use appropriate dtype
+        dtype = BF16 if config.use_bf16 else jnp.float32
+        discount = (-1.0 * jnp.ones_like(value)).astype(dtype)
+        discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=dtype), discount)
         
         # Return new state and output
+        # Return output with appropriate dtype
+        dtype = BF16 if config.use_bf16 else jnp.float32
         return state, SelfplayOutput(
             obs=observation,
-            action_weights=policy_output.action_weights.astype(BF16),
-            reward=state.rewards[jnp.arange(state.rewards.shape[0]), actor].astype(BF16),
+            action_weights=policy_output.action_weights.astype(dtype),
+            reward=state.rewards[jnp.arange(state.rewards.shape[0]), actor].astype(dtype),
             terminated=state.terminated,
             discount=discount,
         )
@@ -296,23 +323,26 @@ def compute_loss_input(data: SelfplayOutput) -> Sample:
     # Compute value target by backwards pass
     def body_fn(carry, i):
         ix = config.max_num_steps - i - 1
-        # Ensure consistent types by explicitly casting
-        reward = data.reward[ix].astype(BF16)
-        discount = data.discount[ix].astype(BF16)
+        # Ensure consistent types
+        dtype = BF16 if config.use_bf16 else jnp.float32
+        reward = data.reward[ix].astype(dtype)
+        discount = data.discount[ix].astype(dtype)
         v = reward + discount * carry
         return v, v
 
+    dtype = BF16 if config.use_bf16 else jnp.float32
     _, value_tgt = jax.lax.scan(
         body_fn,
-        jnp.zeros(batch_size, dtype=BF16),
+        jnp.zeros(batch_size, dtype=dtype),
         jnp.arange(config.max_num_steps),
     )
     # Reverse to get targets in forward order
-    value_tgt = value_tgt[::-1, :].astype(BF16)
+    value_tgt = value_tgt[::-1, :].astype(dtype)
 
+    dtype = BF16 if config.use_bf16 else jnp.float32
     return Sample(
         obs=data.obs,
-        policy_tgt=data.action_weights.astype(BF16),
+        policy_tgt=data.action_weights.astype(dtype),
         value_tgt=value_tgt,
         mask=value_mask,
     )
@@ -324,11 +354,12 @@ def loss_fn(model_params, model_state, samples: Sample):
         model_params, model_state, samples.obs, is_eval=False
     )
 
-    # Ensure BF16 precision
-    logits = logits.astype(BF16)
-    value = value.astype(BF16)
-    policy_tgt = samples.policy_tgt.astype(BF16)
-    value_tgt = samples.value_tgt.astype(BF16)
+    # Ensure correct precision based on config
+    dtype = BF16 if config.use_bf16 else jnp.float32
+    logits = logits.astype(dtype)
+    value = value.astype(dtype)
+    policy_tgt = samples.policy_tgt.astype(dtype)
+    value_tgt = samples.value_tgt.astype(dtype)
 
     # Policy loss (cross entropy)
     policy_loss = optax.softmax_cross_entropy(logits, policy_tgt)
@@ -365,10 +396,16 @@ def train(model, opt_state, data: Sample):
 
 # Add function to cast model parameters to BF16
 def cast_params_to_bf16(params):
-    """Cast all parameters to bfloat16."""
+    """Cast all parameters to bfloat16, preserving integer and boolean types."""
     def _cast(x):
-        if hasattr(x, 'dtype') and x.dtype != BF16 and x.dtype != jnp.int32 and x.dtype != jnp.bool_:
-            return x.astype(BF16)
+        # Only cast floating point arrays to BF16
+        if hasattr(x, 'dtype'):
+            # Skip if already BF16, or if integer/boolean type
+            if x.dtype in (jnp.int32, jnp.int64, jnp.bool_, jnp.uint32, jnp.uint64):
+                return x
+            # Cast float types to BF16
+            if x.dtype in (jnp.float32, jnp.float64, jnp.float16):
+                return x.astype(BF16)
         return x
     return jax.tree_util.tree_map(_cast, params)
 
@@ -384,8 +421,8 @@ def load_model_from_checkpoint(checkpoint_path):
         with open(checkpoint_path, "rb") as f:
             checkpoint = pickle.load(f)
         
-        # Cast model parameters to BF16
-        if "model" in checkpoint:
+        # Cast model parameters to BF16 if configured
+        if "model" in checkpoint and config.use_bf16:
             model_params, model_state = checkpoint["model"]
             checkpoint["model"] = (cast_params_to_bf16(model_params), model_state)
             
@@ -422,8 +459,9 @@ def evaluate(rng_key, my_model):
     def body_fn(val):
         key, state, R = val
         
-        # Get logits from my model - ensure observation is BF16
-        observation = state.observation.astype(BF16)
+        # Get logits from my model - ensure correct dtype
+        dtype = BF16 if config.use_bf16 else jnp.float32
+        observation = state.observation.astype(dtype)
         (my_logits, _), _ = forward.apply(
             my_model_params, my_model_state, observation, is_eval=True
         )
@@ -475,21 +513,33 @@ if __name__ == "__main__":
     # Initialize model and optimizer
     print("Initializing model...")
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
-    dummy_input = dummy_state.observation.astype(BF16)  # Convert to BF16
+    # Convert to appropriate dtype based on config
+    if config.use_bf16:
+        dummy_input = dummy_state.observation.astype(BF16)
+    else:
+        dummy_input = dummy_state.observation.astype(jnp.float32)
     
     # Always try to load from baseline for initial model
     checkpoint = load_model_from_checkpoint(config.baseline)
     if checkpoint is not None:
         print(f"Loading initial model from baseline: {config.baseline}")
         model = checkpoint["model"]
-        # Ensure model parameters are BF16
+        # Ensure model parameters are correct dtype
         model_params, model_state = model
-        model = (cast_params_to_bf16(model_params), model_state)
+        if config.use_bf16:
+            model = (cast_params_to_bf16(model_params), model_state)
+        else:
+            model = (model_params, model_state)
         # Store the baseline model in the global variable for evaluation
         BASELINE_MODEL = model
         
         # Initialize new optimizer state for the loaded model
-        opt_state = optimizer.init(params=model[0])
+        # Convert params to FP32 for optimizer initialization to avoid BF16 dtype issues
+        params_fp32 = jax.tree_util.tree_map(
+            lambda x: x.astype(jnp.float32) if hasattr(x, 'dtype') else x, 
+            model[0]
+        )
+        opt_state = optimizer.init(params=params_fp32)
         
         # Continue training from checkpoint's iteration and stats if available
         if "iteration" in checkpoint:
@@ -513,10 +563,18 @@ if __name__ == "__main__":
         print("Warning: Baseline checkpoint not found. Initializing new model.")
         # Initialize with BF16 input to ensure parameters are BF16
         model = forward.init(jax.random.PRNGKey(0), dummy_input)
-        # Convert parameters to BF16 for safety
+        # Convert parameters to appropriate dtype
         model_params, model_state = model
-        model = (cast_params_to_bf16(model_params), model_state)
-        opt_state = optimizer.init(params=model[0])
+        if config.use_bf16:
+            model = (cast_params_to_bf16(model_params), model_state)
+        else:
+            model = (model_params, model_state)
+        # Convert params to FP32 for optimizer initialization to avoid BF16 dtype issues
+        params_fp32 = jax.tree_util.tree_map(
+            lambda x: x.astype(jnp.float32) if hasattr(x, 'dtype') else x,
+            model[0]
+        )
+        opt_state = optimizer.init(params=params_fp32)
         iteration = 0
         hours = 0.0
         frames = 0
@@ -524,10 +582,11 @@ if __name__ == "__main__":
     # Put model and optimizer on devices
     model, opt_state = jax.device_put_replicated((model, opt_state), devices)
 
-    # Log device type and if hardware supports BF16
+    # Log device type and precision being used
     device_type = jax.devices()[0].platform
-    print(f"Running on {device_type} devices with BF16 precision")
-    wandb.config.update({"device_type": device_type})
+    precision = "BF16" if config.use_bf16 else "FP32"
+    print(f"Running on {device_type} devices with {precision} precision")
+    wandb.config.update({"device_type": device_type, "precision": precision})
 
     # Prepare checkpoint directory
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
