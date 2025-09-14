@@ -148,20 +148,34 @@ class AZNet(hk.Module):
         return policy, value
 
 
+# Set up mixed precision policy for proper BF16 usage on TPU
+try:
+    import jmp
+    if config.use_bf16:
+        # Apply mixed precision policy: FP32 params, BF16 compute, FP32 output
+        mixed_precision_policy = jmp.Policy(
+            param_dtype=jnp.float32,      # Keep parameters in FP32
+            compute_dtype=jnp.bfloat16,   # Use BF16 for computations
+            output_dtype=jnp.float32      # Output in FP32 for stability
+        )
+        hk.mixed_precision.set_policy(AZNet, mixed_precision_policy)
+        print("Mixed precision policy applied: FP32 params, BF16 compute")
+except ImportError:
+    print("JMP not available, using JAX default matmul precision for mixed precision")
+except Exception as e:
+    print(f"Mixed precision policy not applied: {e}")
+
+
 def forward_fn(x, is_eval=False):
-    """Forward function for the neural network.
-    
-    Mixed precision: parameters stay in FP32, computations can use BF16.
-    """
+    """Forward function with safe dtypes: inputs -> FP32, compute precision set by JAX config."""
     net = AZNet(
         num_actions=env.num_actions,
         num_channels=config.num_channels,
         num_blocks=config.num_layers,
         resnet_v2=config.resnet_v2,
     )
-    # Convert inputs to BF16 for computation if configured (parameters stay FP32)
-    if config.use_bf16:
-        x = x.astype(BF16)
+    # Keep inputs in stable FP32 - JAX matmul precision config handles BF16 computation
+    x = jnp.asarray(x, dtype=jnp.float32)
     policy_out, value_out = net(x, is_training=not is_eval, test_local_stats=False)
     return policy_out, value_out
 
@@ -187,8 +201,7 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     
     # Mask invalid actions
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-    dtype = BF16 if config.use_bf16 else jnp.float32
-    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(dtype).min)
+    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(jnp.float32).min)
 
     # Get rewards for current player and calculate discount
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
@@ -198,11 +211,10 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.St
     value = jnp.where(state.terminated, jnp.zeros_like(value), value)
     discount = jnp.where(state.terminated, jnp.zeros_like(discount), discount)
     
-    # Convert to appropriate dtype for computation if needed
-    if config.use_bf16:
-        reward = reward.astype(BF16)
-        discount = discount.astype(BF16)
-        value = value.astype(BF16)
+    # Keep values in FP32 for stability
+    reward = reward.astype(jnp.float32)
+    discount = discount.astype(jnp.float32)
+    value = value.astype(jnp.float32)
 
     # Return output for MCTS
     recurrent_fn_output = mctx.RecurrentFnOutput(
@@ -251,7 +263,7 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             num_simulations=config.num_simulations,
             invalid_actions=~state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            gumbel_scale=jnp.array(1.0, dtype=BF16 if config.use_bf16 else jnp.float32),
+            gumbel_scale=jnp.array(1.0, dtype=jnp.float32),
         )
         
         # Record current player
@@ -261,10 +273,9 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         keys = jax.random.split(key2, batch_size)
         state = jax.vmap(auto_reset(env.step, env.init))(state, policy_output.action, keys)
         
-        # Calculate discount - use appropriate dtype
-        dtype = BF16 if config.use_bf16 else jnp.float32
-        discount = (-1.0 * jnp.ones_like(value)).astype(dtype)
-        discount = jnp.where(state.terminated, jnp.zeros_like(discount, dtype=dtype), discount)
+        # Calculate discount in FP32
+        discount = -jnp.ones_like(value, dtype=jnp.float32)
+        discount = jnp.where(state.terminated, jnp.zeros_like(discount), discount)
         
         # Return new state and output
         # Return output (keep in native dtype, will be converted later if needed)
@@ -485,11 +496,8 @@ if __name__ == "__main__":
     # Initialize model and optimizer
     print("Initializing model...")
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
-    # Convert to appropriate dtype based on config
-    if config.use_bf16:
-        dummy_input = dummy_state.observation.astype(BF16)
-    else:
-        dummy_input = dummy_state.observation.astype(jnp.float32)
+    # Always use FP32 for initialization
+    dummy_input = dummy_state.observation.astype(jnp.float32)
     
     # Always try to load from baseline for initial model
     checkpoint = load_model_from_checkpoint(config.baseline)
@@ -530,7 +538,7 @@ if __name__ == "__main__":
             frames = 0
     else:
         print("Warning: Baseline checkpoint not found. Initializing new model.")
-        # Initialize with BF16 input to ensure parameters are BF16
+        # Initialize with FP32 input
         model = forward.init(jax.random.PRNGKey(0), dummy_input)
         # Keep model parameters in FP32 for storage
         model_params, model_state = model
