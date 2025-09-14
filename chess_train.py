@@ -409,9 +409,11 @@ def ensure_jax_arrays(tree):
     """Convert all numpy arrays in a tree to JAX arrays."""
     def _convert(x):
         if hasattr(x, 'dtype') and not isinstance(x, jnp.ndarray):
-            # Handle bfloat16 specially
+            # Handle bfloat16 specially - convert via float32
             if str(x.dtype) == 'bfloat16':
-                return jnp.array(x, dtype=BF16)
+                # Convert to float32 first, then to JAX bfloat16
+                x_float = x.astype('float32')
+                return jnp.array(x_float, dtype=BF16)
             else:
                 return jnp.array(x)
         return x
