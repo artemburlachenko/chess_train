@@ -168,17 +168,8 @@ def forward_fn(x, is_eval=False):
 
 # Transform forward function and create optimizer
 forward = hk.without_apply_rng(hk.transform_with_state(forward_fn))
-# Create optimizer with FP32 momentum states even when using BF16 parameters
-optimizer = optax.chain(
-    optax.scale_by_adam(
-        b1=0.9, 
-        b2=0.999, 
-        eps=1e-8,
-        mu_dtype=jnp.float32,  # Keep 1st moment in FP32
-        nu_dtype=jnp.float32   # Keep 2nd moment in FP32
-    ),
-    optax.scale(-config.learning_rate)
-)
+# Create optimizer - Adam with standard settings
+optimizer = optax.adam(learning_rate=config.learning_rate)
 
 
 def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.State):
