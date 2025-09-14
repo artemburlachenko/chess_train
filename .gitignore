@@ -1,4 +1,6 @@
 checkpoints/chess_20250504070715/*.ckpt
+checkpoints/*
+wandb*
 full/
 games/
 play/full/
