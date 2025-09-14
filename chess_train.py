@@ -389,17 +389,33 @@ def train(model, opt_state, data: Sample):
 def cast_params_to_bf16(params):
     """Cast all parameters to bfloat16, preserving integer and boolean types."""
     def _cast(x):
-        # Only cast floating point arrays to BF16
+        # Convert numpy arrays to JAX arrays first
         if hasattr(x, 'dtype'):
-            # Skip if already BF16, or if integer/boolean type
+            # Convert to JAX array if it's a numpy array
+            if not isinstance(x, jnp.ndarray):
+                x = jnp.array(x)
+            
+            # Skip if integer/boolean type
             if x.dtype in (jnp.int32, jnp.int64, jnp.bool_, jnp.uint32, jnp.uint64):
                 return x
             # Cast float types to BF16
-            if x.dtype in (jnp.float32, jnp.float64, jnp.float16):
-                return x.astype(BF16)
+            elif x.dtype in (jnp.float32, jnp.float64, jnp.float16) or str(x.dtype) == 'bfloat16':
+                return jnp.array(x, dtype=BF16)
         return x
     return jax.tree_util.tree_map(_cast, params)
 
+
+def ensure_jax_arrays(tree):
+    """Convert all numpy arrays in a tree to JAX arrays."""
+    def _convert(x):
+        if hasattr(x, 'dtype') and not isinstance(x, jnp.ndarray):
+            # Handle bfloat16 specially
+            if str(x.dtype) == 'bfloat16':
+                return jnp.array(x, dtype=BF16)
+            else:
+                return jnp.array(x)
+        return x
+    return jax.tree_util.tree_map(_convert, tree)
 
 def load_model_from_checkpoint(checkpoint_path):
     """Load model from checkpoint file."""
@@ -411,6 +427,12 @@ def load_model_from_checkpoint(checkpoint_path):
     try:
         with open(checkpoint_path, "rb") as f:
             checkpoint = pickle.load(f)
+        
+        # Ensure all arrays are JAX arrays (not numpy)
+        if "model" in checkpoint:
+            checkpoint["model"] = ensure_jax_arrays(checkpoint["model"])
+        if "opt_state" in checkpoint:
+            checkpoint["opt_state"] = ensure_jax_arrays(checkpoint["opt_state"])
         
         # Cast model parameters to BF16 if configured
         if "model" in checkpoint and config.use_bf16:
