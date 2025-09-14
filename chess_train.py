@@ -389,18 +389,25 @@ def train(model, opt_state, data: Sample):
 def cast_params_to_bf16(params):
     """Cast all parameters to bfloat16, preserving integer and boolean types."""
     def _cast(x):
-        # Convert numpy arrays to JAX arrays first
         if hasattr(x, 'dtype'):
-            # Convert to JAX array if it's a numpy array
+            # Convert to JAX array if it's not already
             if not isinstance(x, jnp.ndarray):
-                x = jnp.array(x)
+                # Handle numpy bfloat16 specially
+                if str(x.dtype) == 'bfloat16':
+                    import numpy as np
+                    x = jnp.asarray(np.array(x, dtype=np.float32), dtype=jnp.bfloat16)
+                else:
+                    x = jnp.asarray(x)
             
             # Skip if integer/boolean type
             if x.dtype in (jnp.int32, jnp.int64, jnp.bool_, jnp.uint32, jnp.uint64):
                 return x
             # Cast float types to BF16
-            elif x.dtype in (jnp.float32, jnp.float64, jnp.float16) or str(x.dtype) == 'bfloat16':
-                return jnp.array(x, dtype=BF16)
+            elif x.dtype in (jnp.float32, jnp.float64, jnp.float16):
+                return x.astype(jnp.bfloat16)
+            # Already BF16
+            elif x.dtype == jnp.bfloat16:
+                return x
         return x
     return jax.tree_util.tree_map(_cast, params)
 
@@ -411,8 +418,11 @@ def ensure_jax_arrays(tree):
         if hasattr(x, 'dtype') and not isinstance(x, jnp.ndarray):
             # Handle bfloat16 specially - convert via float32
             if str(x.dtype) == 'bfloat16':
-                # First convert to JAX float32, then to BF16
-                return jnp.asarray(x, dtype=jnp.float32).astype(BF16)
+                # Convert numpy bfloat16 to float32 first (numpy operation),
+                # then to JAX bfloat16
+                import numpy as np
+                x_float32 = np.array(x, dtype=np.float32)
+                return jnp.asarray(x_float32, dtype=jnp.bfloat16)
             else:
                 return jnp.asarray(x)
         return x
@@ -634,12 +644,15 @@ if __name__ == "__main__":
             # Save checkpoint
             print(f"Saving checkpoint at iteration {iteration}...")
             model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (model, opt_state))
+            # Convert model to CPU and ensure it's in a serializable format
+            model_cpu = jax.device_get(model_0)
+            opt_state_cpu = jax.device_get(opt_state_0)
             with open(os.path.join(ckpt_dir, f"{iteration:06d}.ckpt"), "wb") as f:
                 dic = {
                     "config": config,
                     "rng_key": rng_key,
-                    "model": jax.device_get(model_0),
-                    "opt_state": jax.device_get(opt_state_0),
+                    "model": model_cpu,
+                    "opt_state": opt_state_cpu,
                     "iteration": iteration,
                     "frames": frames,
                     "hours": hours,
