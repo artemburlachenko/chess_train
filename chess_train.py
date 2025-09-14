@@ -418,11 +418,12 @@ def ensure_jax_arrays(tree):
         if hasattr(x, 'dtype') and not isinstance(x, jnp.ndarray):
             # Handle bfloat16 specially - convert via float32
             if str(x.dtype) == 'bfloat16':
-                # Convert numpy bfloat16 to float32 first (numpy operation),
-                # then to JAX bfloat16
+                # Convert numpy bfloat16 to float32 first, then to JAX
                 import numpy as np
                 x_float32 = np.array(x, dtype=np.float32)
-                return jnp.asarray(x_float32, dtype=jnp.bfloat16)
+                # First convert to JAX float32, then cast to bfloat16
+                jax_float32 = jnp.asarray(x_float32)
+                return jax_float32.astype(jnp.bfloat16)
             else:
                 return jnp.asarray(x)
         return x
