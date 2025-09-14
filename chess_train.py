@@ -63,6 +63,21 @@ else:
     # Default config when imported
     config = Config()
 
+# Disable BF16 to avoid all mixed precision issues
+config.use_bf16 = False
+
+# Clear any mixed precision policies immediately
+try:
+    import haiku as hk
+    # Try to clear any global mixed precision policies
+    try:
+        hk.mixed_precision.clear_policy()
+        print("Cleared global mixed precision policies at startup")
+    except:
+        pass
+except:
+    pass
+
 # Create chess environment
 env = pgx.make(config.env_id)
 
@@ -490,8 +505,8 @@ if __name__ == "__main__":
     # Initialize wandb
     wandb.init(project="pgx-chess-az", config=config.model_dump())
     
-    # Log mixed precision usage
-    wandb.config.update({"using_mixed_precision": config.use_bf16})
+    # Log precision usage
+    wandb.config.update({"using_mixed_precision": False, "tensor_precision": "FP32"})
 
     # Initialize model and optimizer
     print("Initializing model...")
@@ -565,8 +580,8 @@ if __name__ == "__main__":
 
     # Log device type and precision being used
     device_type = jax.devices()[0].platform
-    precision = "BF16" if config.use_bf16 else "FP32"
-    print(f"Running on {device_type} devices with {precision} precision")
+    precision = "FP32"  # Always use FP32 to avoid dtype issues
+    print(f"Running on {device_type} devices with {precision} precision (matmuls use BF16 via JAX config)")
     wandb.config.update({"device_type": device_type, "precision": precision})
 
     # Prepare checkpoint directory
